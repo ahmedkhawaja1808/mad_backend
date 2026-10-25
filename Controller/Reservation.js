@@ -1,3 +1,4 @@
+import mongoose from "mongoose";
 import Reservation from "../Schema/Reservation.js";
 import Table from "../Schema/Table.js";
 import User from "../Schema/User.js";
@@ -17,6 +18,13 @@ export const createReservation = async (req, res) => {
             return res.status(400).json({
                 success: false,
                 message: "Please provide table, date, start time, and number of guests"
+            });
+        }
+
+        if (!mongoose.isValidObjectId(table)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid table ID"
             });
         }
 
@@ -60,11 +68,10 @@ export const createReservation = async (req, res) => {
             `${String(Math.floor(endMinutes / 60)).padStart(2, "0")}:` +
             `${String(endMinutes % 60).padStart(2, "0")}`;
 
-        const now = new Date();
         const reservationStart = new Date(reservationDate);
         reservationStart.setHours(hours, minutes, 0, 0);
 
-        if (reservationStart <= now) {
+        if (reservationStart <= new Date()) {
             return res.status(400).json({
                 success: false,
                 message: "Reservation must be in the future"
@@ -107,12 +114,16 @@ export const createReservation = async (req, res) => {
         });
 
         const hasConflict = existingReservations.some((reservation) => {
-            return (
-                startMinutes < reservation.endTime.split(":").map(Number)[0] * 60 +
-                    Number(reservation.endTime.split(":")[1]) &&
-                endMinutes > reservation.startTime.split(":").map(Number)[0] * 60 +
-                    Number(reservation.startTime.split(":")[1])
-            );
+            const [existingStartHours, existingStartMinutes] =
+                reservation.startTime.split(":").map(Number);
+
+            const [existingEndHours, existingEndMinutes] =
+                reservation.endTime.split(":").map(Number);
+
+            const existingStart = existingStartHours * 60 + existingStartMinutes;
+            const existingEnd = existingEndHours * 60 + existingEndMinutes;
+
+            return startMinutes < existingEnd && endMinutes > existingStart;
         });
 
         if (hasConflict) {
@@ -191,6 +202,13 @@ export const getReservation = async (req, res) => {
             });
         }
 
+        if (!mongoose.isValidObjectId(req.params.id)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid reservation ID"
+            });
+        }
+
         const reservation = await Reservation.findById(req.params.id)
             .populate({ path: "user", select: "name email", model: User })
             .populate("table");
@@ -199,6 +217,17 @@ export const getReservation = async (req, res) => {
             return res.status(404).json({
                 success: false,
                 message: "Reservation not found"
+            });
+        }
+
+        const isOwner =
+            reservation.user._id.toString() === req.user._id.toString();
+        const isManager = req.user.role === "Manager";
+
+        if (!isOwner && !isManager) {
+            return res.status(403).json({
+                success: false,
+                message: "You are not allowed to view this reservation"
             });
         }
 
@@ -254,6 +283,20 @@ export const getAllReservations = async (req, res) => {
 
 export const updateReservationStatus = async (req, res) => {
     try {
+        if (!req.user || req.user.role !== "Manager") {
+            return res.status(403).json({
+                success: false,
+                message: "Only managers can update reservation status"
+            });
+        }
+
+        if (!mongoose.isValidObjectId(req.params.id)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid reservation ID"
+            });
+        }
+
         const { status } = req.body;
 
         const allowedStatuses = [
@@ -283,10 +326,8 @@ export const updateReservationStatus = async (req, res) => {
             const [hours, minutes] = reservation.startTime.split(":").map(Number);
             const startMinutes = hours * 60 + minutes;
 
-            const [endHours, endMinutesPart] = reservation.endTime
-                .split(":")
-                .map(Number);
-            const finishMinutes = endHours * 60 + endMinutesPart;
+            const [endHours, endMinutes] = reservation.endTime.split(":").map(Number);
+            const finishMinutes = endHours * 60 + endMinutes;
 
             const dayStart = new Date(reservation.date);
             dayStart.setHours(0, 0, 0, 0);
@@ -304,8 +345,7 @@ export const updateReservationStatus = async (req, res) => {
             const hasConflict = otherReservations.some((other) => {
                 const [otherStartHours, otherStartMinutes] =
                     other.startTime.split(":").map(Number);
-                const otherStart =
-                    otherStartHours * 60 + otherStartMinutes;
+                const otherStart = otherStartHours * 60 + otherStartMinutes;
 
                 const [otherEndHours, otherEndMinutes] =
                     other.endTime.split(":").map(Number);
@@ -353,6 +393,13 @@ export const deleteReservation = async (req, res) => {
             });
         }
 
+        if (!mongoose.isValidObjectId(req.params.id)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid reservation ID"
+            });
+        }
+
         const reservation = await Reservation.findById(req.params.id);
 
         if (!reservation) {
@@ -390,375 +437,211 @@ export const deleteReservation = async (req, res) => {
 };
 
 export const checkTableAvailability = async (req, res) => {
-  let stage = "Starting availability check";
+    try {
+        const { tableId, date, startTime, endTime, guests = 1 } = req.query;
 
-  try {
-    const {
-      tableId,
-      date,
-      startTime,
-      endTime,
-      guests = 1,
-    } = req.query;
+        if (!date || !startTime) {
+            return res.status(400).json({
+                success: false,
+                message: "Please provide date and start time"
+            });
+        }
 
-    console.log("[AVAILABILITY] Request:", {
-      tableId,
-      date,
-      startTime,
-      endTime,
-      guests,
-    });
+        if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(startTime)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid start time format. Use HH:mm"
+            });
+        }
 
-    // ----------------------------------
-    // 1. VALIDATE REQUEST
-    // ----------------------------------
+        const reservationDate = new Date(date);
 
-    stage = "Validating request";
+        if (Number.isNaN(reservationDate.getTime())) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid reservation date"
+            });
+        }
 
-    if (!date || !startTime) {
-      return res.status(400).json({
-        success: false,
-        message: "Date and start time are required",
-      });
-    }
+        const guestCount = Number(guests);
 
-    const timePattern =
-      /^([01]\d|2[0-3]):([0-5]\d)$/;
+        if (!Number.isInteger(guestCount) || guestCount < 1) {
+            return res.status(400).json({
+                success: false,
+                message: "Guests must be a positive integer"
+            });
+        }
 
-    if (!timePattern.test(startTime)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid start time. Use HH:mm",
-      });
-    }
+        const [startHours, startMinutes] = startTime.split(":").map(Number);
+        const requestedStart = startHours * 60 + startMinutes;
 
-    const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+        let requestedEnd;
 
-    if (!datePattern.test(date)) {
-      return res.status(400).json({
-        success: false,
-        message: "Date must use YYYY-MM-DD format",
-      });
-    }
+        if (endTime) {
+            if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(endTime)) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid end time format. Use HH:mm"
+                });
+            }
 
-    const reservationDate = new Date(
-      `${date}T00:00:00.000Z`
-    );
+            const [endHours, endMinutes] = endTime.split(":").map(Number);
+            requestedEnd = endHours * 60 + endMinutes;
+        } else {
+            requestedEnd = requestedStart + 60;
+        }
 
-    if (
-      Number.isNaN(reservationDate.getTime()) ||
-      reservationDate.toISOString().slice(0, 10) !== date
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid reservation date",
-      });
-    }
+        if (requestedEnd <= requestedStart || requestedEnd > 24 * 60) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid reservation time range"
+            });
+        }
 
-    const guestCount = Number(guests);
+        const reservationStart = new Date(reservationDate);
+        reservationStart.setHours(startHours, startMinutes, 0, 0);
 
-    if (
-      !Number.isInteger(guestCount) ||
-      guestCount < 1
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Guests must be a positive integer",
-      });
-    }
+        if (reservationStart <= new Date()) {
+            return res.status(400).json({
+                success: false,
+                message: "Reservation date and time must be in the future"
+            });
+        }
 
-    // ----------------------------------
-    // 2. CALCULATE BOOKING TIME
-    // ----------------------------------
+        if (tableId && !mongoose.isValidObjectId(tableId)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid table ID"
+            });
+        }
 
-    const [hours, minutes] = startTime
-      .split(":")
-      .map(Number);
+        const dayStart = new Date(reservationDate);
+        dayStart.setHours(0, 0, 0, 0);
 
-    const requestedStart = hours * 60 + minutes;
+        const dayEnd = new Date(reservationDate);
+        dayEnd.setHours(23, 59, 59, 999);
 
-    // Enforce the schema's one-hour duration.
-    const requestedEnd = requestedStart + 60;
+        if (tableId) {
+            const selectedTable = await Table.findById(tableId);
 
-    if (requestedEnd > 1440) {
-      return res.status(400).json({
-        success: false,
-        message: "Reservation cannot extend beyond midnight",
-      });
-    }
+            if (!selectedTable) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Table not found"
+                });
+            }
 
-    const calculatedEndTime = [
-      String(Math.floor(requestedEnd / 60)).padStart(
-        2,
-        "0"
-      ),
-      String(requestedEnd % 60).padStart(2, "0"),
-    ].join(":");
+            const tableReservations = await Reservation.find({
+                table: selectedTable._id,
+                date: { $gte: dayStart, $lte: dayEnd },
+                status: { $in: ["Pending", "Confirmed"] }
+            });
 
-    if (
-      endTime !== undefined &&
-      endTime !== calculatedEndTime
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Reservation must last exactly one hour",
-      });
-    }
+            const conflicts = tableReservations.filter((reservation) => {
+                const [existingStartHours, existingStartMinutes] =
+                    reservation.startTime.split(":").map(Number);
+                const [existingEndHours, existingEndMinutes] =
+                    reservation.endTime.split(":").map(Number);
 
-    // ----------------------------------
-    // 3. DATE RANGE
-    // ----------------------------------
+                const existingStart = existingStartHours * 60 + existingStartMinutes;
+                const existingEnd = existingEndHours * 60 + existingEndMinutes;
 
-    // The create controller receives YYYY-MM-DD,
-    // which is stored as midnight UTC.
-    // Use a half-open UTC range consistently.
+                return requestedStart < existingEnd && requestedEnd > existingStart;
+            });
 
-    const dayStart = new Date(reservationDate);
+            let reason = null;
 
-    const dayEnd = new Date(
-      dayStart.getTime() + 24 * 60 * 60 * 1000
-    );
+            if (selectedTable.isAvailable === false) {
+                reason = "This table is not available";
+            } else if (guestCount > selectedTable.seats) {
+                reason = `This table can accommodate only ${selectedTable.seats} guests`;
+            } else if (conflicts.length > 0) {
+                reason = "This table is already reserved for that time";
+            }
 
-    console.log("[AVAILABILITY] Date range:", {
-      dayStart: dayStart.toISOString(),
-      dayEnd: dayEnd.toISOString(),
-    });
+            const available = reason === null;
 
-    // ----------------------------------
-    // 4. LOAD TABLES
-    // ----------------------------------
+            return res.status(200).json({
+                success: true,
+                available,
+                isAvailable: available,
+                table: selectedTable,
+                availableTables: available ? [selectedTable] : [],
+                conflictingReservations: conflicts.map((reservation) => ({
+                    startTime: reservation.startTime,
+                    endTime: reservation.endTime,
+                    status: reservation.status
+                })),
+                message: available
+                    ? "Table is available for the selected time"
+                    : reason
+            });
+        }
 
-    stage = "Loading tables";
+        const allTables = await Table.find();
 
-    let allTables;
-
-    if (tableId) {
-      if (
-        !/^[a-fA-F0-9]{24}$/.test(String(tableId))
-      ) {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid table ID",
+        const reservations = await Reservation.find({
+            date: { $gte: dayStart, $lte: dayEnd },
+            status: { $in: ["Pending", "Confirmed"] }
         });
-      }
 
-      const selectedTable = await Table.findById(
-        tableId
-      ).lean();
+        const tableResults = allTables.map((table) => {
+            const conflicts = reservations.filter((reservation) => {
+                if (String(reservation.table) !== String(table._id)) {
+                    return false;
+                }
 
-      if (!selectedTable) {
-        return res.status(404).json({
-          success: false,
-          message: "Table not found",
+                const [existingStartHours, existingStartMinutes] =
+                    reservation.startTime.split(":").map(Number);
+                const [existingEndHours, existingEndMinutes] =
+                    reservation.endTime.split(":").map(Number);
+
+                const existingStart = existingStartHours * 60 + existingStartMinutes;
+                const existingEnd = existingEndHours * 60 + existingEndMinutes;
+
+                return requestedStart < existingEnd && requestedEnd > existingStart;
+            });
+
+            let reason = null;
+
+            if (table.isAvailable === false) {
+                reason = "Table is not available";
+            } else if (guestCount > table.seats) {
+                reason = `Table capacity is ${table.seats} guests`;
+            } else if (conflicts.length > 0) {
+                reason = "Already reserved for this time";
+            }
+
+            return {
+                table,
+                available: reason === null,
+                reason
+            };
         });
-      }
 
-      allTables = [selectedTable];
-    } else {
-      allTables = await Table.find().lean();
+        const availableTables = tableResults
+            .filter((item) => item.available)
+            .map((item) => item.table);
+
+        return res.status(200).json({
+            success: true,
+            date,
+            startTime,
+            endTime:
+                endTime ||
+                `${String(Math.floor(requestedEnd / 60)).padStart(2, "0")}:${String(requestedEnd % 60).padStart(2, "0")}`,
+            guests: guestCount,
+            totalTables: allTables.length,
+            availableCount: availableTables.length,
+            availableTables,
+            tables: tableResults
+        });
+    } catch (error) {
+        console.error("Check table availability error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to check table availability"
+        });
     }
-
-    console.log(
-      "[AVAILABILITY] Tables found:",
-      allTables.length
-    );
-
-    // ----------------------------------
-    // 5. LOAD EXISTING RESERVATIONS
-    // ----------------------------------
-
-    stage = "Loading reservations";
-
-    const reservationQuery = {
-      date: {
-        $gte: dayStart,
-        $lt: dayEnd,
-      },
-      status: {
-        $in: ["Pending", "Confirmed"],
-      },
-    };
-
-    if (tableId) {
-      reservationQuery.table = tableId;
-    }
-
-    console.log(
-      "[AVAILABILITY] Querying reservations"
-    );
-
-    const reservations = await Reservation.find(
-      reservationQuery
-    ).lean();
-
-    console.log(
-      "[AVAILABILITY] Reservations found:",
-      reservations.length
-    );
-
-    // Zero reservations is completely valid.
-    // In that case, no table has a booking conflict.
-
-    // ----------------------------------
-    // 6. CHECK TIME CONFLICTS
-    // ----------------------------------
-
-    stage = "Calculating availability";
-
-    const toMinutes = (time) => {
-      if (
-        typeof time !== "string" ||
-        !timePattern.test(time)
-      ) {
-        return null;
-      }
-
-      const [h, m] = time.split(":").map(Number);
-
-      return h * 60 + m;
-    };
-
-    const tableResults = allTables.map((table) => {
-      const tableIdString = String(table._id);
-
-      let hasConflict = false;
-      const conflictingReservations = [];
-
-      for (const reservation of reservations) {
-        if (
-          String(reservation.table) !== tableIdString
-        ) {
-          continue;
-        }
-
-        const existingStart = toMinutes(
-          reservation.startTime
-        );
-
-        const existingEnd = toMinutes(
-          reservation.endTime
-        );
-
-        if (
-          existingStart === null ||
-          existingEnd === null
-        ) {
-          console.warn(
-            "[AVAILABILITY] Invalid reservation time:",
-            String(reservation._id)
-          );
-
-          // Fail closed for malformed bookings:
-          // don't accidentally offer an occupied table.
-          hasConflict = true;
-          continue;
-        }
-
-        const overlaps =
-          requestedStart < existingEnd &&
-          requestedEnd > existingStart;
-
-        if (overlaps) {
-          hasConflict = true;
-
-          conflictingReservations.push({
-            startTime: reservation.startTime,
-            endTime: reservation.endTime,
-            status: reservation.status,
-          });
-        }
-      }
-
-      let reason = null;
-
-      if (table.isAvailable === false) {
-        reason = "Table is not available";
-      } else if (
-        !Number.isFinite(Number(table.seats)) ||
-        Number(table.seats) < 1
-      ) {
-        reason = "Table capacity is not configured";
-      } else if (guestCount > Number(table.seats)) {
-        reason = `Table capacity is ${table.seats} guests`;
-      } else if (hasConflict) {
-        reason = "Already reserved for this time";
-      }
-
-      return {
-        table,
-        available: reason === null,
-        reason,
-        conflictingReservations,
-      };
-    });
-
-    // ----------------------------------
-    // 7. GET AVAILABLE TABLES
-    // ----------------------------------
-
-    const availableTables = tableResults
-      .filter((item) => item.available)
-      .map((item) => item.table);
-
-    console.log("[AVAILABILITY] Result:", {
-      totalTables: allTables.length,
-      availableCount: availableTables.length,
-    });
-
-    // ----------------------------------
-    // 8. SINGLE TABLE RESPONSE
-    // ----------------------------------
-
-    if (tableId) {
-      const result = tableResults[0];
-
-      return res.status(200).json({
-        success: true,
-        available: result.available,
-        isAvailable: result.available,
-        table: result.table,
-        availableTables,
-        conflictingReservations:
-          result.conflictingReservations,
-        message: result.available
-          ? "Table is available for the selected time"
-          : result.reason,
-      });
-    }
-
-    // ----------------------------------
-    // 9. ALL TABLES RESPONSE
-    // ----------------------------------
-
-    return res.status(200).json({
-      success: true,
-      date,
-      startTime,
-      endTime: calculatedEndTime,
-      guests: guestCount,
-      totalTables: allTables.length,
-      availableCount: availableTables.length,
-      availableTables,
-      tables: tableResults,
-    });
-  } catch (error) {
-    // Logs will identify exactly which
-    // operation failed on Vercel.
-
-    console.error(
-      "[AVAILABILITY] FAILED AT:",
-      stage
-    );
-
-    console.error(
-      "[AVAILABILITY] Error:",
-      error
-    );
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to check table availability",
-      stage,
-    });
-  }
 };
